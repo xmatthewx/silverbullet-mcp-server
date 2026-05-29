@@ -1,0 +1,36 @@
+# fly.toml — silverbullet-mcp
+#
+# Set secrets before first deploy:
+#   fly secrets set SB_URL=https://notes.example.com
+#   fly secrets set SB_TOKEN=...           # the SB_AUTH_TOKEN on the SB side
+#   fly secrets set MCP_TOKEN=$(openssl rand -hex 32)
+#
+# Then:
+#   fly deploy
+
+app  = "silverbullet-mcp"
+primary_region = "ewr"   # Newark — close to NYC
+
+[build]
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"     # scale to zero when idle
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "get"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
