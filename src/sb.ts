@@ -259,6 +259,10 @@ export class SilverBulletClient {
    * @param opts.position - `"after_frontmatter"` (default) inserts after the
    *   closing `---` of YAML frontmatter, if present; falls back to top of file.
    *   `"top"` always inserts at byte 0.
+   *
+   * When inserting after frontmatter a blank line is added between the closing
+   * `---` fence and the prepended content, matching Markdown paragraph convention.
+   * Top-mode inserts at byte 0 with no leading blank line.
    */
   async prependToPage(
     page: string,
@@ -290,8 +294,9 @@ export class SilverBulletClient {
       }
     }
 
+    const leadingSep = insertedAfterFrontmatter ? "\n" : "";
     const combined =
-      existing.slice(0, insertAt) + content + "\n" + existing.slice(insertAt);
+      existing.slice(0, insertAt) + leadingSep + content + "\n" + existing.slice(insertAt);
 
     if (Buffer.byteLength(combined, "utf8") > MAX_WRITE_BYTES) {
       throw new Error(

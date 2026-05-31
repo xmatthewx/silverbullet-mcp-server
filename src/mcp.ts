@@ -42,7 +42,7 @@ function logWrite(action: WriteAction, page: string, bytes: number, extra?: Reco
 export function buildMcpServer(sb: SilverBulletClient): McpServer {
   const server = new McpServer({
     name: "silverbullet",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   server.registerTool(
