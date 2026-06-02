@@ -1,7 +1,8 @@
 # silverbullet-mcp
 
 A tiny MCP server that exposes a [SilverBullet](https://silverbullet.md) space
-to Claude over HTTP. v0.1 shipped read tools; v0.2 added a full write surface.
+to Claude over HTTP. v0.1 shipped read tools; v0.2 added a full write surface;
+v0.3 made overwrites collision-safe via `lastModified` envelopes.
 
 ## Architecture
 
@@ -31,30 +32,32 @@ Any of them can rotate without touching the others.
 
 ## Tools
 
-**Read tools (v0.1)**
+**Read tools**
 
 | Tool           | Inputs                             | Returns                                              |
 | -------------- | ---------------------------------- | ---------------------------------------------------- |
-| `list_pages`   | `include_trash?` (bool, def false) | Every `.md` page in the space, sorted by recency.    |
-| `read_page`    | `page` (string)                    | Raw markdown source.                                 |
-| `search_pages` | `query`, `limit?`, `include_trash?`| Top substring matches with snippets and match counts.|
+| `list_pages`   | `include_trash?` (bool, def false) | Every `.md` page in the space, sorted by recency. Each entry carries `{page, path, lastModified}`. |
+| `read_page`    | `page` (string)                    | Two content blocks: `[0]` JSON envelope `{path, lastModified}`, `[1]` raw markdown body. The `lastModified` is the version marker for a follow-up `write_page`. |
+| `search_pages` | `query`, `limit?`, `include_trash?`| Top substring matches with snippets and match counts. |
 
 `include_trash: true` surfaces pages that have been soft-deleted (under `_trash/`).
 
 Search is naive (fan-out fetch + substring). Fine for personal note volumes;
 revisit if latency bites.
 
-**Write tools (v0.2)**
+**Write tools**
 
 | Tool              | Inputs                                        | Behavior                                                         |
 | ----------------- | --------------------------------------------- | ---------------------------------------------------------------- |
-| `create_page`     | `page`, `body`                                | Creates a new page; errors if it already exists.                 |
-| `write_page`      | `page`, `body`                                | Overwrites or creates a page (wholesale replace).                |
-| `append_to_page`  | `page`, `content`                             | Appends content at the end, separated by a blank line.           |
-| `prepend_to_page` | `page`, `content`, `position?`                | Inserts at top or after YAML frontmatter (default). Server-side concat — the existing body never passes through the model. |
+| `create_page`     | `page`, `body`                                | Creates a new page; errors if it already exists. Returns `{path, lastModified}`. |
+| `write_page`      | `page`, `body`, `expected_last_modified`      | Overwrites an existing page. **Collision-safe**: rejected with a conflict error if the server's current `lastModified` differs from `expected_last_modified`. Refuses to create new pages (use `create_page`). Returns `{path, lastModified}`. |
+| `append_to_page`  | `page`, `content`                             | Appends content at the end, separated by a blank line. No `lastModified` returned (caller has not seen the body and isn't write-ready). |
+| `prepend_to_page` | `page`, `content`, `position?`                | Inserts at top or after YAML frontmatter (default). Server-side concat — the existing body never passes through the model. No `lastModified` returned. |
 | `delete_page`     | `page`                                        | Soft-deletes to `_trash/YYYY-MM/<original-path>`.                |
 
-**Write permission model.** Writes are gated by Claude.ai's per-tool permission UI — set each write tool to Ask for confirmation before every call. No server-side flag or separate OAuth scope; the same connector and credentials serve both read and write tools. On every write the server enforces: a 256 KB body cap, path validation (no `..`, empty segments, double `.md`), and `X-Permission: rw` on every PUT (omitting it would make SilverBullet silently mark the page read-only in its UI). Soft-delete moves pages to `_trash/YYYY-MM/`; collisions in the same month get a `-<unix-ms>` filename suffix. Trash is hidden from list and search by default; `include_trash: true` reveals it. All write operations emit `[WRITE]` audit lines to stderr (visible in Fly logs).
+**Collision-safe overwrites.** `write_page` enforces a version handshake. Workflow: `read_page` returns the current `lastModified` alongside the body; pass that value back as `expected_last_modified` on the subsequent `write_page`. If the page changed in between, the write is rejected with a conflict error and the caller should re-read to reconcile. `create_page` returns a fresh `lastModified` so a caller is left write-ready immediately after creation. `append_to_page` and `prepend_to_page` deliberately omit `lastModified` from their responses — they merge server-side without the caller seeing the full body, so the caller is not in a position to follow up with a guarded `write_page`. There is a narrow TOCTOU window inside `write_page` between the conflict check and the PUT — acceptable for a single-user space; closing it would require an `If-Unmodified-Since` (or equivalent) on the SilverBullet side.
+
+**Write permission model.** Writes are gated by Claude.ai's per-tool permission UI — set each write tool to Ask for confirmation before every call. No server-side flag or separate OAuth scope; the same connector and credentials serve both read and write tools. On every write the server enforces: a 256 KB body cap, path validation (no `..`, empty segments, double `.md`), and `X-Permission: rw` on every PUT (omitting it would make SilverBullet silently mark the page read-only in its UI). Soft-delete moves pages to `_trash/YYYY-MM/`; collisions in the same month get a `-<unix-ms>` filename suffix. Trash is hidden from list and search by default; `include_trash: true` reveals it. All write operations emit `[WRITE]` audit lines to stderr (visible in Fly logs); `write_page` audit lines include both `expected_last_modified` and the resulting `last_modified`.
 
 ## Environment
 
@@ -170,9 +173,10 @@ immediately, rotate `JWT_SIGNING_KEY` and redeploy.
 ## Roadmap
 
 - v0.2 — write tools: `create_page`, `write_page`, `append_to_page`, `prepend_to_page`, `delete_page`. Soft-delete, 256 KB cap, audit logging. **Shipped.**
-- v0.3 — cached file index, real search ranking, frontmatter awareness.
-- v0.4 — refresh tokens, so JWT renewal is silent.
-- future — path-prefix allowlist (restrict writes to specific directories if the broad write surface ever feels too open); atomic writes (current SB backend uses non-atomic `os.WriteFile`).
+- v0.3 — collision-safe overwrites via `lastModified` envelopes; `read_page` returns `{path, lastModified}` + body; `write_page` requires `expected_last_modified` and is overwrite-only. **Shipped.**
+- v0.4 — cached file index, real search ranking, frontmatter awareness.
+- v0.5 — refresh tokens, so JWT renewal is silent.
+- future — path-prefix allowlist (restrict writes to specific directories if the broad write surface ever feels too open); atomic writes (current SB backend uses non-atomic `os.WriteFile`); switch `statFile` to a header-based metadata GET once SB's `Last-Modified` header behavior is verified, to avoid the per-write directory listing.
 
 See `Home/docs/silverbullet/silverbullet-mcp-setup.md` for active task list,
 testing plan, and decision log.

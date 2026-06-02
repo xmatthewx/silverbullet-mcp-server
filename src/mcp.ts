@@ -16,7 +16,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { SilverBulletClient } from "./sb.js";
+import { ConflictError, PageNotFoundError, SilverBulletClient } from "./sb.js";
 
 type WriteAction = "create" | "write" | "append" | "prepend" | "delete";
 
@@ -42,7 +42,7 @@ function logWrite(action: WriteAction, page: string, bytes: number, extra?: Reco
 export function buildMcpServer(sb: SilverBulletClient): McpServer {
   const server = new McpServer({
     name: "silverbullet",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   server.registerTool(
@@ -50,7 +50,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "List pages",
       description:
-        "Return every markdown page in the SilverBullet space, sorted by last modified. Use this to discover what notes exist before reading or searching.",
+        "Return every markdown page in the SilverBullet space, sorted by last modified. Each entry carries {page, path, lastModified}. Use this to discover what notes exist before reading or searching. The lastModified value is suitable as expected_last_modified on write_page, though usually you'll want to read_page first to also see the body.",
       inputSchema: {
         include_trash: z
           .boolean()
@@ -80,7 +80,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "Read page",
       description:
-        "Return the raw markdown source of a page. Accepts a page name with or without the .md suffix (e.g. 'projects/silverbullet-mcp' or 'index').",
+        "Return a page as two content blocks: [0] a JSON envelope {path, lastModified}, [1] the raw markdown body. The lastModified is the version marker — pass it back as expected_last_modified on a follow-up write_page to guard against interim edits. Accepts a page name with or without the .md suffix (e.g. 'projects/silverbullet-mcp' or 'index').",
       inputSchema: {
         page: z
           .string()
@@ -89,9 +89,15 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ page }) => {
-      const body = await sb.readPage(page);
+      const { content, lastModified, path } = await sb.readPageEnvelope(page);
       return {
-        content: [{ type: "text", text: body }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ path, lastModified }, null, 2),
+          },
+          { type: "text", text: content },
+        ],
       };
     },
   );
@@ -139,7 +145,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "Create page",
       description:
-        "Create a brand-new page. Errors if the page already exists — use write_page if you intend to overwrite. Path is validated; cannot write into _trash/. Body is capped at 256 KB.",
+        "Create a brand-new page. Errors if the page already exists — use write_page if you intend to overwrite. Returns the resulting {path, lastModified}, leaving the caller write-ready for a follow-up write_page. Path is validated; cannot write into _trash/. Body is capped at 256 KB.",
       inputSchema: {
         page: z.string().min(1).describe("Page name relative to the space root, without the .md suffix"),
         body: z.string().describe("Full markdown content for the new page"),
@@ -147,8 +153,10 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     },
     async ({ page, body }) => {
       const result = await sb.createPage(page, body);
-      logWrite("create", result.path, Buffer.byteLength(body, "utf8"));
-      const payload = { created: true, path: result.path };
+      logWrite("create", result.path, Buffer.byteLength(body, "utf8"), {
+        last_modified: result.lastModified,
+      });
+      const payload = { created: true, path: result.path, lastModified: result.lastModified };
       return {
         content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
       };
@@ -158,21 +166,64 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
   server.registerTool(
     "write_page",
     {
-      title: "Write page (overwrite)",
+      title: "Write page (overwrite, collision-safe)",
       description:
-        "OVERWRITES the existing page body, or creates the page if absent. Always confirm with the user before calling this — content is replaced wholesale, not merged. For new pages, prefer create_page. For adding to existing content, prefer append_to_page or prepend_to_page. Body is capped at 256 KB; refuses paths under _trash/.",
+        "OVERWRITES an existing page wholesale. Requires expected_last_modified — the lastModified value the caller obtained from a prior read_page (or list_pages). If the server's current value differs, the write is rejected with a conflict error and the caller should re-read to reconcile. Refuses to create new pages; route those through create_page. Refuses paths under _trash/. Body is capped at 256 KB. Returns the new lastModified, leaving the caller write-ready for further overwrites. For adding to existing content, prefer append_to_page or prepend_to_page (no version handshake needed, since they merge server-side).",
       inputSchema: {
         page: z.string().min(1).describe("Page name relative to the space root, without the .md suffix"),
         body: z.string().describe("Full markdown content to write (replaces any existing body)"),
+        expected_last_modified: z
+          .number()
+          .int()
+          .describe(
+            "The lastModified value from a prior read_page (ms since epoch). The write only succeeds if the server's current lastModified matches.",
+          ),
       },
     },
-    async ({ page, body }) => {
-      const result = await sb.writePage(page, body);
-      logWrite("write", result.path, Buffer.byteLength(body, "utf8"));
-      const payload = { written: true, path: result.path };
-      return {
-        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-      };
+    async ({ page, body, expected_last_modified }) => {
+      try {
+        const result = await sb.writePage(page, body, expected_last_modified);
+        logWrite("write", result.path, Buffer.byteLength(body, "utf8"), {
+          expected_last_modified,
+          last_modified: result.lastModified,
+        });
+        const payload = {
+          written: true,
+          path: result.path,
+          lastModified: result.lastModified,
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          const payload = {
+            error: "conflict",
+            message: err.message,
+            path: err.path,
+            expectedLastModified: err.expectedLastModified,
+            actualLastModified: err.actualLastModified,
+            remediation: "Call read_page to fetch the current body and lastModified, then retry write_page.",
+          };
+          return {
+            isError: true,
+            content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          };
+        }
+        if (err instanceof PageNotFoundError) {
+          const payload = {
+            error: "not_found",
+            message: err.message,
+            path: err.path,
+            remediation: "Use create_page for new pages.",
+          };
+          return {
+            isError: true,
+            content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          };
+        }
+        throw err;
+      }
     },
   );
 
@@ -181,7 +232,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "Append to page",
       description:
-        "Append a block of text to the end of a page, separated by a blank line. Creates the page if it does not exist. The existing page body is read server-side and never round-trips through this conversation, which avoids accidental modification of existing content. Final page size is capped at 256 KB.",
+        "Append a block of text to the end of a page, separated by a blank line. Creates the page if it does not exist. The existing page body is read server-side and never round-trips through this conversation, which avoids accidental modification of existing content. Final page size is capped at 256 KB. Does not return lastModified — append intentionally leaves the caller without a version marker, since you have not seen the full body and so are not in a position to follow up with write_page. Call read_page if you need to.",
       inputSchema: {
         page: z.string().min(1).describe("Page name relative to the space root, without the .md suffix"),
         content: z.string().min(1).describe("Text to append"),
@@ -201,7 +252,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "Prepend to page",
       description:
-        "Insert content at the top of a page. By default, inserts after YAML frontmatter if present (so frontmatter stays at byte 0); set position to \"top\" to force insertion at byte 0 even when frontmatter exists. Creates the page if it does not exist. The existing page body is read server-side and never round-trips through this conversation. Final page size is capped at 256 KB.",
+        "Insert content at the top of a page. By default, inserts after YAML frontmatter if present (so frontmatter stays at byte 0); set position to \"top\" to force insertion at byte 0 even when frontmatter exists. Creates the page if it does not exist. The existing page body is read server-side and never round-trips through this conversation. Final page size is capped at 256 KB. Does not return lastModified — prepend intentionally leaves the caller without a version marker, since you have not seen the full body and so are not in a position to follow up with write_page. Call read_page if you need to.",
       inputSchema: {
         page: z.string().min(1).describe("Page name relative to the space root, without the .md suffix"),
         content: z.string().min(1).describe("Text to insert"),

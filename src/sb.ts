@@ -65,6 +65,42 @@ export interface SearchHit {
   matches: number;     // total match count in this file
 }
 
+/**
+ * Thrown when a conditional write fails because the page on the server has
+ * been modified since the caller's last read.
+ *
+ * Carries the actual lastModified so the caller can decide whether to retry
+ * after re-reading, or surface the conflict to the user.
+ */
+export class ConflictError extends Error {
+  readonly path: string;
+  readonly expectedLastModified: number;
+  readonly actualLastModified: number;
+  constructor(path: string, expected: number, actual: number) {
+    super(
+      `Conflict on ${path}: expected lastModified=${expected}, server has ${actual}. ` +
+        `Re-read the page to reconcile before writing again.`
+    );
+    this.name = "ConflictError";
+    this.path = path;
+    this.expectedLastModified = expected;
+    this.actualLastModified = actual;
+  }
+}
+
+/**
+ * Thrown by writePage when the target page does not exist. The intent of
+ * write_page is overwrite-only; new pages must go through create_page.
+ */
+export class PageNotFoundError extends Error {
+  readonly path: string;
+  constructor(path: string) {
+    super(`Page does not exist: ${path}. Use create_page for new pages.`);
+    this.name = "PageNotFoundError";
+    this.path = path;
+  }
+}
+
 export class SilverBulletClient {
   constructor(
     private readonly baseUrl: string,
@@ -132,10 +168,47 @@ export class SilverBulletClient {
     return r.text();
   }
 
+  /**
+   * Return the lastModified for a path, or null if absent.
+   *
+   * Sourced from the /.fs directory listing — the same value surfaced via
+   * list_pages — so reads and writes compare apples to apples. One extra
+   * round-trip per call; acceptable at personal-note scale. If the space
+   * grows large enough that the listing latency bites, switch to a
+   * header-based stat (Last-Modified on a metadata GET) once we've verified
+   * which header SB sets in production.
+   */
+  async statFile(path: string): Promise<{ lastModified: number } | null> {
+    const files = await this.listFiles();
+    const hit = files.find((f) => f.name === path);
+    return hit ? { lastModified: hit.lastModified } : null;
+  }
+
   /** Read a markdown page by its page name (with or without .md). */
   async readPage(page: string): Promise<string> {
     const path = page.endsWith(".md") ? page : `${page}.md`;
     return this.readFile(path);
+  }
+
+  /**
+   * Read a page and return an envelope carrying its current lastModified.
+   *
+   * The lastModified value lets a caller pass it back as expectedLastModified
+   * on a subsequent writePage to guard against interim edits. It is sourced
+   * from the /.fs directory listing for consistency with list_pages.
+   *
+   * Throws Not found if the page is absent. Also throws Not found if the
+   * body read succeeds but the directory listing has no entry — that would
+   * indicate a server-side race we'd rather surface than paper over.
+   */
+  async readPageEnvelope(
+    page: string,
+  ): Promise<{ content: string; lastModified: number; path: string }> {
+    const path = page.endsWith(".md") ? page : `${page}.md`;
+    const content = await this.readFile(path);
+    const stat = await this.statFile(path);
+    if (!stat) throw new Error(`Not found in listing after read: ${path}`);
+    return { content, lastModified: stat.lastModified, path };
   }
 
   /**
@@ -190,23 +263,58 @@ export class SilverBulletClient {
   }
 
   /**
-   * Write (overwrite) a page by name (with or without .md).
-   * Refuses to write into `_trash/` — use softDeletePage for that.
+   * Overwrite an existing page. Refuses to create a new page; refuses to
+   * write into `_trash/`.
+   *
+   * Collision-safe: requires expectedLastModified, which the caller obtained
+   * from a prior readPageEnvelope (or list_pages). If the current server
+   * lastModified differs, throws ConflictError so the caller can re-read and
+   * decide whether to retry.
+   *
+   * Returns the new lastModified, so the caller is left write-ready for a
+   * follow-up overwrite without an extra read.
+   *
+   * A narrow TOCTOU window exists between the stat check and the PUT —
+   * unavoidable without an If-Unmodified-Since equivalent on the SB side.
+   * Acceptable for a single-user space; document the limitation.
    */
-  async writePage(page: string, body: string): Promise<{ path: string }> {
+  async writePage(
+    page: string,
+    body: string,
+    expectedLastModified: number,
+  ): Promise<{ path: string; lastModified: number }> {
     const path = validatePagePath(page);
     if (path.startsWith("_trash/")) {
       throw new Error("Refusing to write into _trash/; use delete_page to soft-delete");
     }
+
+    const before = await this.statFile(path);
+    if (!before) throw new PageNotFoundError(path);
+    if (before.lastModified !== expectedLastModified) {
+      throw new ConflictError(path, expectedLastModified, before.lastModified);
+    }
+
     await this.writeFile(path, body);
-    return { path };
+
+    const after = await this.statFile(path);
+    if (!after) {
+      // Wrote successfully but the directory listing has no entry — surface
+      // rather than fabricate a value.
+      throw new Error(`Wrote ${path} but it is missing from the file listing afterwards`);
+    }
+    return { path, lastModified: after.lastModified };
   }
 
   /**
    * Create a new page. Throws if the page already exists.
    * Refuses to create inside `_trash/`.
+   *
+   * Returns the new lastModified, leaving the caller write-ready.
    */
-  async createPage(page: string, body: string): Promise<{ path: string }> {
+  async createPage(
+    page: string,
+    body: string,
+  ): Promise<{ path: string; lastModified: number }> {
     const path = validatePagePath(page);
     if (path.startsWith("_trash/")) {
       throw new Error("Refusing to write into _trash/; use delete_page to soft-delete");
@@ -215,7 +323,12 @@ export class SilverBulletClient {
       throw new Error(`Page already exists: ${page}`);
     }
     await this.writeFile(path, body);
-    return { path };
+
+    const after = await this.statFile(path);
+    if (!after) {
+      throw new Error(`Wrote ${path} but it is missing from the file listing afterwards`);
+    }
+    return { path, lastModified: after.lastModified };
   }
 
   /**
