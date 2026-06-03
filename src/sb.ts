@@ -11,6 +11,30 @@
 const MAX_WRITE_BYTES = 256 * 1024;
 
 /**
+ * Hard timeout for any upstream HTTP request. Node's fetch has no default
+ * timeout — a stalled TCP connection would otherwise block the MCP request
+ * indefinitely. 20s is generous for a personal SB instance but still
+ * short enough that the Claude.ai connector won't have hung up first.
+ */
+const FETCH_TIMEOUT_MS = 20_000;
+
+/**
+ * Extract the underlying cause from a fetch error so the UpstreamError
+ * message names the actual failure (ENOTFOUND, ECONNRESET, ETIMEDOUT,
+ * UND_ERR_CONNECT_TIMEOUT, certificate error, etc.) instead of just
+ * "fetch failed".
+ */
+function describeFetchError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const cause = (err as Error & { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    const code = (cause as Error & { code?: string }).code;
+    return code ? `${err.message}: ${code} ${cause.message}` : `${err.message}: ${cause.message}`;
+  }
+  return err.message;
+}
+
+/**
  * Normalize a page name or path to a safe `.md` path.
  *
  * Rules:
@@ -21,29 +45,31 @@ const MAX_WRITE_BYTES = 256 * 1024;
  * - Returns the validated path string (e.g. `foo/bar.md`).
  */
 export function validatePagePath(page: string): string {
+  const original = page;
+
   // Reject absolute paths before normalization.
   if (page.startsWith("/")) {
     const stripped = page.slice(1);
-    if (!stripped) throw new Error(`Invalid page path: "${page}" — empty after stripping leading slash`);
+    if (!stripped) throw new InvalidPathError(original, "empty after stripping leading slash");
     page = stripped;
   }
 
-  if (!page) throw new Error(`Invalid page path: empty string`);
+  if (!page) throw new InvalidPathError(original, "empty string");
 
   const segments = page.split("/");
   for (const seg of segments) {
     if (seg === ".." || seg === ".") {
-      throw new Error(`Invalid page path: "${page}" — path traversal not allowed`);
+      throw new InvalidPathError(original, "path traversal not allowed");
     }
     if (seg === "") {
-      throw new Error(`Invalid page path: "${page}" — empty segment`);
+      throw new InvalidPathError(original, "empty segment");
     }
   }
 
   const path = page.endsWith(".md") ? page : `${page}.md`;
 
   if (path.includes(".md.md")) {
-    throw new Error(`Invalid page path: "${page}" — results in double .md extension`);
+    throw new InvalidPathError(original, "results in double .md extension");
   }
 
   return path;
@@ -101,6 +127,80 @@ export class PageNotFoundError extends Error {
   }
 }
 
+/** Thrown when a file path is not present on the SB server (read/delete). */
+export class FileNotFoundError extends Error {
+  readonly path: string;
+  constructor(path: string) {
+    super(`Not found: ${path}`);
+    this.name = "FileNotFoundError";
+    this.path = path;
+  }
+}
+
+/** Thrown by createPage when the target page already exists. */
+export class PageAlreadyExistsError extends Error {
+  readonly path: string;
+  constructor(path: string) {
+    super(`Page already exists: ${path}`);
+    this.name = "PageAlreadyExistsError";
+    this.path = path;
+  }
+}
+
+/** Thrown when a write body (after any server-side concat) exceeds the cap. */
+export class BodyTooLargeError extends Error {
+  readonly path: string | null;
+  readonly bytes: number;
+  readonly limit: number;
+  constructor(path: string | null, bytes: number, limit: number) {
+    super(
+      `Body too large${path ? ` for ${path}` : ""}: ${bytes} bytes exceeds limit of ${limit} bytes (${Math.round(limit / 1024)} KB)`
+    );
+    this.name = "BodyTooLargeError";
+    this.path = path;
+    this.bytes = bytes;
+    this.limit = limit;
+  }
+}
+
+/** Thrown when a write targets a forbidden subtree (currently _trash/). */
+export class ForbiddenPathError extends Error {
+  readonly path: string;
+  constructor(path: string, reason: string) {
+    super(`Forbidden path ${path}: ${reason}`);
+    this.name = "ForbiddenPathError";
+    this.path = path;
+  }
+}
+
+/** Thrown by validatePagePath when the input fails structural checks. */
+export class InvalidPathError extends Error {
+  readonly input: string;
+  readonly reason: string;
+  constructor(input: string, reason: string) {
+    super(`Invalid page path "${input}": ${reason}`);
+    this.name = "InvalidPathError";
+    this.input = input;
+    this.reason = reason;
+  }
+}
+
+/**
+ * Thrown when the upstream SilverBullet server returns a non-2xx response or
+ * is unreachable. Carries the HTTP status when available so callers can
+ * distinguish transient (5xx/0) from permanent (4xx) failures.
+ */
+export class UpstreamError extends Error {
+  readonly status: number | null;
+  readonly path: string | null;
+  constructor(message: string, status: number | null, path: string | null) {
+    super(message);
+    this.name = "UpstreamError";
+    this.status = status;
+    this.path = path;
+  }
+}
+
 export class SilverBulletClient {
   constructor(
     private readonly baseUrl: string,
@@ -133,11 +233,76 @@ export class SilverBulletClient {
     return path.split("/").map(encodeURIComponent).join("/");
   }
 
+  /**
+   * Single point of entry for upstream HTTP requests.
+   *
+   * Wraps `fetch` with:
+   *   - A hard timeout via AbortSignal (FETCH_TIMEOUT_MS).
+   *   - `redirect: "manual"` so an SB auth redirect (302 → /auth) doesn't
+   *     get silently followed and then fail at the JSON parse step.
+   *   - Cause-chain extraction so the UpstreamError message says the real
+   *     thing (ENOTFOUND, ECONNRESET, …) instead of bare "fetch failed".
+   *
+   * Returns the Response if and only if it's a non-redirect, non-2xx-or-2xx
+   * outcome. The caller decides whether to treat non-OK statuses as errors.
+   * Throws UpstreamError on fetch failure, timeout, or any 3xx (treated as
+   * auth/config drift on /.fs endpoints).
+   */
+  private async sbFetch(
+    url: string,
+    init: RequestInit,
+    ctx: { verb: string; path: string | null },
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let r: Response;
+    try {
+      r = await fetch(url, { ...init, signal: controller.signal, redirect: "manual" });
+    } catch (e) {
+      const detail = describeFetchError(e);
+      const aborted = (e as Error)?.name === "AbortError";
+      throw new UpstreamError(
+        aborted
+          ? `SB request timed out after ${FETCH_TIMEOUT_MS}ms while ${ctx.verb}${ctx.path ? ` ${ctx.path}` : ""}`
+          : `SB unreachable while ${ctx.verb}${ctx.path ? ` ${ctx.path}` : ""}: ${detail}`,
+        null,
+        ctx.path,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // 3xx on /.fs is almost always an auth-stale redirect to the login page.
+    // Surface it as a clear UpstreamError instead of letting the caller try
+    // to parse the auth-page HTML as JSON.
+    if (r.status >= 300 && r.status < 400) {
+      throw new UpstreamError(
+        `SB returned ${r.status} (redirect) while ${ctx.verb}${ctx.path ? ` ${ctx.path}` : ""}; ` +
+          `the upstream SB_TOKEN may be stale or the endpoint may have moved`,
+        r.status,
+        ctx.path,
+      );
+    }
+    return r;
+  }
+
   /** Return every file in the space with metadata. */
   async listFiles(): Promise<SBFile[]> {
-    const r = await fetch(`${this.baseUrl}/.fs`, { headers: this.headers() });
-    if (!r.ok) throw new Error(`SB list failed: ${r.status} ${r.statusText}`);
-    return (await r.json()) as SBFile[];
+    const r = await this.sbFetch(
+      `${this.baseUrl}/.fs`,
+      { headers: this.headers() },
+      { verb: "listing files", path: null },
+    );
+    if (!r.ok) throw new UpstreamError(`SB list failed: ${r.status} ${r.statusText}`, r.status, null);
+    try {
+      return (await r.json()) as SBFile[];
+    } catch (e) {
+      throw new UpstreamError(
+        `SB returned non-JSON while listing files: ${(e as Error).message}`,
+        r.status,
+        null,
+      );
+    }
   }
 
   /**
@@ -162,9 +327,13 @@ export class SilverBulletClient {
   /** Read raw file content (markdown source). */
   async readFile(path: string): Promise<string> {
     const safe = this.encodePath(path);
-    const r = await fetch(`${this.baseUrl}/.fs/${safe}`, { headers: this.headers() });
-    if (r.status === 404) throw new Error(`Not found: ${path}`);
-    if (!r.ok) throw new Error(`SB read failed: ${r.status} ${path}`);
+    const r = await this.sbFetch(
+      `${this.baseUrl}/.fs/${safe}`,
+      { headers: this.headers() },
+      { verb: "reading", path },
+    );
+    if (r.status === 404) throw new FileNotFoundError(path);
+    if (!r.ok) throw new UpstreamError(`SB read failed: ${r.status} ${path}`, r.status, path);
     return r.text();
   }
 
@@ -186,7 +355,7 @@ export class SilverBulletClient {
 
   /** Read a markdown page by its page name (with or without .md). */
   async readPage(page: string): Promise<string> {
-    const path = page.endsWith(".md") ? page : `${page}.md`;
+    const path = validatePagePath(page);
     return this.readFile(path);
   }
 
@@ -197,52 +366,55 @@ export class SilverBulletClient {
    * on a subsequent writePage to guard against interim edits. It is sourced
    * from the /.fs directory listing for consistency with list_pages.
    *
-   * Throws Not found if the page is absent. Also throws Not found if the
-   * body read succeeds but the directory listing has no entry — that would
-   * indicate a server-side race we'd rather surface than paper over.
+   * Throws InvalidPathError if the input fails validation, FileNotFoundError
+   * if the page is absent. The "missing from listing after a successful
+   * body read" case maps to FileNotFoundError too — this happens when the
+   * input encodes a path that the SB server URL-resolves (e.g. `../foo`
+   * collapsing) such that the body read succeeds against a different file
+   * than the listing entry, which we'd rather surface clearly than paper
+   * over.
    */
   async readPageEnvelope(
     page: string,
   ): Promise<{ content: string; lastModified: number; path: string }> {
-    const path = page.endsWith(".md") ? page : `${page}.md`;
+    const path = validatePagePath(page);
     const content = await this.readFile(path);
     const stat = await this.statFile(path);
-    if (!stat) throw new Error(`Not found in listing after read: ${path}`);
+    if (!stat) throw new FileNotFoundError(path);
     return { content, lastModified: stat.lastModified, path };
   }
 
   /**
    * Write raw file content via PUT.
-   * Throws if body exceeds MAX_WRITE_BYTES (256 KB).
+   * Throws BodyTooLargeError if body exceeds MAX_WRITE_BYTES (256 KB).
    */
   async writeFile(path: string, body: string): Promise<void> {
     const byteLen = Buffer.byteLength(body, "utf8");
     if (byteLen > MAX_WRITE_BYTES) {
-      throw new Error(
-        `Body too large: ${byteLen} bytes exceeds limit of ${MAX_WRITE_BYTES} bytes (256 KB)`
-      );
+      throw new BodyTooLargeError(path, byteLen, MAX_WRITE_BYTES);
     }
     const safe = this.encodePath(path);
-    const r = await fetch(`${this.baseUrl}/.fs/${safe}`, {
-      method: "PUT",
-      headers: this.writeHeaders(),
-      body,
-    });
-    if (!r.ok) throw new Error(`SB write failed: ${r.status} ${path}`);
+    const r = await this.sbFetch(
+      `${this.baseUrl}/.fs/${safe}`,
+      { method: "PUT", headers: this.writeHeaders(), body },
+      { verb: "writing", path },
+    );
+    if (!r.ok) throw new UpstreamError(`SB write failed: ${r.status} ${path}`, r.status, path);
   }
 
   /**
    * Delete a file via DELETE.
-   * Throws with "Not found" message on 404.
+   * Throws FileNotFoundError on 404.
    */
   async deleteFile(path: string): Promise<void> {
     const safe = this.encodePath(path);
-    const r = await fetch(`${this.baseUrl}/.fs/${safe}`, {
-      method: "DELETE",
-      headers: this.headers(),
-    });
-    if (r.status === 404) throw new Error(`Not found: ${path}`);
-    if (!r.ok) throw new Error(`SB delete failed: ${r.status} ${path}`);
+    const r = await this.sbFetch(
+      `${this.baseUrl}/.fs/${safe}`,
+      { method: "DELETE", headers: this.headers() },
+      { verb: "deleting", path },
+    );
+    if (r.status === 404) throw new FileNotFoundError(path);
+    if (!r.ok) throw new UpstreamError(`SB delete failed: ${r.status} ${path}`, r.status, path);
   }
 
   /**
@@ -251,15 +423,14 @@ export class SilverBulletClient {
    */
   async existsFile(path: string): Promise<boolean> {
     const safe = this.encodePath(path);
-    const r = await fetch(`${this.baseUrl}/.fs/${safe}`, {
-      headers: {
-        ...this.headers(),
-        "X-Get-Meta": "true",
-      },
-    });
+    const r = await this.sbFetch(
+      `${this.baseUrl}/.fs/${safe}`,
+      { headers: { ...this.headers(), "X-Get-Meta": "true" } },
+      { verb: "checking", path },
+    );
     if (r.status === 200) return true;
     if (r.status === 404) return false;
-    throw new Error(`SB exists check failed: ${r.status} ${path}`);
+    throw new UpstreamError(`SB exists check failed: ${r.status} ${path}`, r.status, path);
   }
 
   /**
@@ -285,7 +456,7 @@ export class SilverBulletClient {
   ): Promise<{ path: string; lastModified: number }> {
     const path = validatePagePath(page);
     if (path.startsWith("_trash/")) {
-      throw new Error("Refusing to write into _trash/; use delete_page to soft-delete");
+      throw new ForbiddenPathError(path, "writes into _trash/ are not allowed; use delete_page to soft-delete");
     }
 
     const before = await this.statFile(path);
@@ -317,10 +488,10 @@ export class SilverBulletClient {
   ): Promise<{ path: string; lastModified: number }> {
     const path = validatePagePath(page);
     if (path.startsWith("_trash/")) {
-      throw new Error("Refusing to write into _trash/; use delete_page to soft-delete");
+      throw new ForbiddenPathError(path, "writes into _trash/ are not allowed; use delete_page to soft-delete");
     }
     if (await this.existsFile(path)) {
-      throw new Error(`Page already exists: ${page}`);
+      throw new PageAlreadyExistsError(path);
     }
     await this.writeFile(path, body);
 
@@ -342,7 +513,7 @@ export class SilverBulletClient {
   async appendToPage(page: string, content: string): Promise<{ path: string; bytesAdded: number }> {
     const path = validatePagePath(page);
     if (path.startsWith("_trash/")) {
-      throw new Error("Refusing to write into _trash/; use delete_page to soft-delete");
+      throw new ForbiddenPathError(path, "writes into _trash/ are not allowed; use delete_page to soft-delete");
     }
 
     const bytesAdded = Buffer.byteLength(content, "utf8");
@@ -356,10 +527,9 @@ export class SilverBulletClient {
     if (!existing.endsWith("\n")) existing += "\n";
     const combined = existing + "\n" + content;
 
-    if (Buffer.byteLength(combined, "utf8") > MAX_WRITE_BYTES) {
-      throw new Error(
-        `Append would exceed size limit of ${MAX_WRITE_BYTES} bytes (256 KB)`
-      );
+    const combinedBytes = Buffer.byteLength(combined, "utf8");
+    if (combinedBytes > MAX_WRITE_BYTES) {
+      throw new BodyTooLargeError(path, combinedBytes, MAX_WRITE_BYTES);
     }
 
     await this.writeFile(path, combined);
@@ -384,7 +554,7 @@ export class SilverBulletClient {
   ): Promise<{ path: string; bytesAdded: number; insertedAfterFrontmatter: boolean }> {
     const path = validatePagePath(page);
     if (path.startsWith("_trash/")) {
-      throw new Error("Refusing to write into _trash/; use delete_page to soft-delete");
+      throw new ForbiddenPathError(path, "writes into _trash/ are not allowed; use delete_page to soft-delete");
     }
 
     const bytesAdded = Buffer.byteLength(content, "utf8");
@@ -411,10 +581,9 @@ export class SilverBulletClient {
     const combined =
       existing.slice(0, insertAt) + leadingSep + content + "\n" + existing.slice(insertAt);
 
-    if (Buffer.byteLength(combined, "utf8") > MAX_WRITE_BYTES) {
-      throw new Error(
-        `Prepend would exceed size limit of ${MAX_WRITE_BYTES} bytes (256 KB)`
-      );
+    const combinedBytes = Buffer.byteLength(combined, "utf8");
+    if (combinedBytes > MAX_WRITE_BYTES) {
+      throw new BodyTooLargeError(path, combinedBytes, MAX_WRITE_BYTES);
     }
 
     await this.writeFile(path, combined);
@@ -435,7 +604,7 @@ export class SilverBulletClient {
   async softDeletePage(page: string): Promise<{ trashPath: string }> {
     const path = validatePagePath(page);
     if (path.startsWith("_trash/")) {
-      throw new Error("Page is already in trash — refusing to trash the trash");
+      throw new ForbiddenPathError(path, "page is already in trash; cannot soft-delete it again");
     }
 
     // Reads the file (surfaces Not found via existing error path).
@@ -530,11 +699,15 @@ export class SilverBulletClient {
 
   /** Lightweight health check — calls SB's /.ping. */
   async ping(): Promise<boolean> {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-      const r = await fetch(`${this.baseUrl}/.ping`);
+      const r = await fetch(`${this.baseUrl}/.ping`, { signal: controller.signal });
       return r.ok;
     } catch {
       return false;
+    } finally {
+      clearTimeout(t);
     }
   }
 }

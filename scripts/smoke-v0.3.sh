@@ -120,14 +120,29 @@ tool write_page "{\"page\":\"${PAGE}\",\"body\":\"won't land\",\"expected_last_m
 hr "6. write_page against a non-existent page (not_found expected)"
 tool write_page "{\"page\":\"silverbullet/_smoke-no-such-page-$(date +%s)\",\"body\":\"x\",\"expected_last_modified\":0}"
 
-hr "7. append_to_page (no lastModified in response)"
+hr "7. create_page on existing path (already_exists expected)"
+tool create_page "{\"page\":\"${PAGE}\",\"body\":\"x\"}"
+
+hr "8. create_page into _trash/ (forbidden_path expected)"
+tool create_page "{\"page\":\"_trash/should-fail\",\"body\":\"x\"}"
+
+hr "9. read_page on non-existent page (not_found expected)"
+tool read_page "{\"page\":\"silverbullet/_smoke-definitely-not-there-$(date +%s)\"}"
+
+hr "10. invalid path (invalid_path expected)"
+tool read_page "{\"page\":\"../escape\"}"
+
+hr "11. append_to_page (no lastModified in response)"
 tool append_to_page "{\"page\":\"${PAGE}\",\"content\":\"appended line\"}"
 
-hr "8. prepend_to_page (no lastModified in response)"
+hr "12. prepend_to_page (no lastModified in response)"
 tool prepend_to_page "{\"page\":\"${PAGE}\",\"content\":\"prepended line\"}"
 
-hr "9. cleanup: delete_page"
+hr "13. cleanup: delete_page"
 tool delete_page "{\"page\":\"${PAGE}\"}"
 
 echo
 echo "done. session: $SESSION"
+echo "every error response above should be a normal content block whose JSON"
+echo "payload starts with an \"error\" field (conflict, not_found, already_exists,"
+echo "forbidden_path, invalid_path). isError must NOT be true on any of them."

@@ -16,7 +16,17 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { ConflictError, PageNotFoundError, SilverBulletClient } from "./sb.js";
+import {
+  BodyTooLargeError,
+  ConflictError,
+  FileNotFoundError,
+  ForbiddenPathError,
+  InvalidPathError,
+  PageAlreadyExistsError,
+  PageNotFoundError,
+  SilverBulletClient,
+  UpstreamError,
+} from "./sb.js";
 
 type WriteAction = "create" | "write" | "append" | "prepend" | "delete";
 
@@ -39,10 +49,163 @@ function logWrite(action: WriteAction, page: string, bytes: number, extra?: Reco
   console.error(parts.join(" "));
 }
 
+/** Emit a structured error-audit line to stderr (mirrors logWrite shape). */
+function logError(tool: string, code: string, page: string | undefined, extra?: Record<string, unknown>): void {
+  const parts = [
+    `[ERROR]`,
+    `tool=${tool}`,
+    `code=${code}`,
+    `page=${JSON.stringify(page ?? null)}`,
+  ];
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      parts.push(`${k}=${JSON.stringify(v)}`);
+    }
+  }
+  console.error(parts.join(" "));
+}
+
+/**
+ * Build a tool-result content block from an error payload.
+ *
+ * NOTE: we deliberately do NOT set `isError: true`. The Claude.ai connector
+ * has been observed to swallow the content block when isError is set,
+ * surfacing only a generic "Error occurred during tool execution" string to
+ * the model. Returning the payload as regular content guarantees the model
+ * sees the full structured error, including the remediation hint. The
+ * payload's `error` field stands in as the machine-readable status.
+ */
+function toolError(payload: Record<string, unknown>) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+  };
+}
+
+/**
+ * Map any thrown error to a uniform tool-result content block.
+ *
+ * Typed errors from sb.ts produce structured payloads with an HTTP-style
+ * status, the offending path, any error-specific detail, and a remediation
+ * hint. Anything else falls through to `internal`, which preserves the raw
+ * message so the model and the user can still see what happened rather
+ * than a generic "tool execution failed" string.
+ */
+function mapToolError(err: unknown, ctx: { tool: string; page?: string }) {
+  if (err instanceof ConflictError) {
+    logError(ctx.tool, "conflict", ctx.page, {
+      expected: err.expectedLastModified,
+      actual: err.actualLastModified,
+    });
+    return toolError({
+      error: "conflict",
+      status: 409,
+      message: err.message,
+      path: err.path,
+      expectedLastModified: err.expectedLastModified,
+      actualLastModified: err.actualLastModified,
+      remediation:
+        "Re-read the page to fetch its current body and lastModified, then retry write_page with that value.",
+    });
+  }
+  if (err instanceof PageNotFoundError) {
+    logError(ctx.tool, "not_found", ctx.page);
+    return toolError({
+      error: "not_found",
+      status: 404,
+      message: err.message,
+      path: err.path,
+      remediation: "Use create_page for new pages.",
+    });
+  }
+  if (err instanceof FileNotFoundError) {
+    logError(ctx.tool, "not_found", ctx.page);
+    return toolError({
+      error: "not_found",
+      status: 404,
+      message: err.message,
+      path: err.path,
+      remediation:
+        "Verify the page name with list_pages (or include_trash: true if you expect a soft-deleted page).",
+    });
+  }
+  if (err instanceof PageAlreadyExistsError) {
+    logError(ctx.tool, "already_exists", ctx.page);
+    return toolError({
+      error: "already_exists",
+      status: 409,
+      message: err.message,
+      path: err.path,
+      remediation:
+        "Use write_page (with expected_last_modified from a read_page) to overwrite, or pick a different page name.",
+    });
+  }
+  if (err instanceof BodyTooLargeError) {
+    logError(ctx.tool, "too_large", ctx.page, { bytes: err.bytes, limit: err.limit });
+    return toolError({
+      error: "too_large",
+      status: 413,
+      message: err.message,
+      path: err.path,
+      bytes: err.bytes,
+      limit: err.limit,
+      remediation: "Split the content into smaller pages or shorten the input.",
+    });
+  }
+  if (err instanceof ForbiddenPathError) {
+    logError(ctx.tool, "forbidden_path", ctx.page);
+    return toolError({
+      error: "forbidden_path",
+      status: 403,
+      message: err.message,
+      path: err.path,
+      remediation:
+        "Pick a path outside _trash/. Use delete_page to soft-delete an existing page.",
+    });
+  }
+  if (err instanceof InvalidPathError) {
+    logError(ctx.tool, "invalid_path", ctx.page);
+    return toolError({
+      error: "invalid_path",
+      status: 422,
+      message: err.message,
+      input: err.input,
+      reason: err.reason,
+      remediation:
+        "Use a relative path with no '..', '.', empty segments, or '.md.md' (e.g. 'projects/foo' or 'index').",
+    });
+  }
+  if (err instanceof UpstreamError) {
+    const transient = err.status === null || err.status >= 500;
+    logError(ctx.tool, "upstream", ctx.page, { status: err.status });
+    return toolError({
+      error: "upstream",
+      status: err.status ?? 503,
+      message: err.message,
+      path: err.path,
+      transient,
+      remediation: transient
+        ? "The upstream SilverBullet server is unreachable or returned a 5xx. Retry in a moment (the host may be cold-starting)."
+        : "The upstream SilverBullet server returned a non-2xx status. Check the page path and try again.",
+    });
+  }
+  // Unknown shape — still surface message so it isn't opaque.
+  const message = err instanceof Error ? err.message : String(err);
+  logError(ctx.tool, "internal", ctx.page, { message });
+  return toolError({
+    error: "internal",
+    status: 500,
+    message,
+    tool: ctx.tool,
+    page: ctx.page,
+    remediation:
+      "Unexpected server-side error. Retry once; if it persists, check Fly logs for context.",
+  });
+}
+
 export function buildMcpServer(sb: SilverBulletClient): McpServer {
   const server = new McpServer({
     name: "silverbullet",
-    version: "0.3.0",
+    version: "0.4.1",
   });
 
   server.registerTool(
@@ -59,19 +222,23 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ include_trash }) => {
-      const pages = await sb.listPages({ includeTrash: include_trash });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { count: pages.length, pages },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      try {
+        const pages = await sb.listPages({ includeTrash: include_trash });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { count: pages.length, pages },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return mapToolError(err, { tool: "list_pages" });
+      }
     },
   );
 
@@ -89,16 +256,20 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ page }) => {
-      const { content, lastModified, path } = await sb.readPageEnvelope(page);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ path, lastModified }, null, 2),
-          },
-          { type: "text", text: content },
-        ],
-      };
+      try {
+        const { content, lastModified, path } = await sb.readPageEnvelope(page);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ path, lastModified }, null, 2),
+            },
+            { type: "text", text: content },
+          ],
+        };
+      } catch (err) {
+        return mapToolError(err, { tool: "read_page", page });
+      }
     },
   );
 
@@ -111,6 +282,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       inputSchema: {
         query: z.string().min(1).describe("Substring to search for"),
         limit: z
+          .coerce
           .number()
           .int()
           .positive()
@@ -124,19 +296,23 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ query, limit, include_trash }) => {
-      const hits = await sb.searchPages(query, limit ?? 20, { includeTrash: include_trash });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { query, count: hits.length, hits },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      try {
+        const hits = await sb.searchPages(query, limit ?? 20, { includeTrash: include_trash });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { query, count: hits.length, hits },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return mapToolError(err, { tool: "search_pages" });
+      }
     },
   );
 
@@ -152,14 +328,18 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ page, body }) => {
-      const result = await sb.createPage(page, body);
-      logWrite("create", result.path, Buffer.byteLength(body, "utf8"), {
-        last_modified: result.lastModified,
-      });
-      const payload = { created: true, path: result.path, lastModified: result.lastModified };
-      return {
-        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-      };
+      try {
+        const result = await sb.createPage(page, body);
+        logWrite("create", result.path, Buffer.byteLength(body, "utf8"), {
+          last_modified: result.lastModified,
+        });
+        const payload = { created: true, path: result.path, lastModified: result.lastModified };
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (err) {
+        return mapToolError(err, { tool: "create_page", page });
+      }
     },
   );
 
@@ -173,10 +353,11 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
         page: z.string().min(1).describe("Page name relative to the space root, without the .md suffix"),
         body: z.string().describe("Full markdown content to write (replaces any existing body)"),
         expected_last_modified: z
+          .coerce
           .number()
           .int()
           .describe(
-            "The lastModified value from a prior read_page (ms since epoch). The write only succeeds if the server's current lastModified matches.",
+            "The lastModified value from a prior read_page (ms since epoch). The write only succeeds if the server's current lastModified matches. Accepted as either a JSON number or a numeric string — some MCP clients serialize large integers as strings on the wire.",
           ),
       },
     },
@@ -196,33 +377,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
           content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
         };
       } catch (err) {
-        if (err instanceof ConflictError) {
-          const payload = {
-            error: "conflict",
-            message: err.message,
-            path: err.path,
-            expectedLastModified: err.expectedLastModified,
-            actualLastModified: err.actualLastModified,
-            remediation: "Call read_page to fetch the current body and lastModified, then retry write_page.",
-          };
-          return {
-            isError: true,
-            content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-          };
-        }
-        if (err instanceof PageNotFoundError) {
-          const payload = {
-            error: "not_found",
-            message: err.message,
-            path: err.path,
-            remediation: "Use create_page for new pages.",
-          };
-          return {
-            isError: true,
-            content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-          };
-        }
-        throw err;
+        return mapToolError(err, { tool: "write_page", page });
       }
     },
   );
@@ -239,11 +394,15 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ page, content }) => {
-      const result = await sb.appendToPage(page, content);
-      logWrite("append", result.path, result.bytesAdded);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      try {
+        const result = await sb.appendToPage(page, content);
+        logWrite("append", result.path, result.bytesAdded);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err) {
+        return mapToolError(err, { tool: "append_to_page", page });
+      }
     },
   );
 
@@ -263,13 +422,17 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ page, content, position }) => {
-      const result = await sb.prependToPage(page, content, { position });
-      logWrite("prepend", result.path, result.bytesAdded, {
-        inserted_after_frontmatter: result.insertedAfterFrontmatter,
-      });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      try {
+        const result = await sb.prependToPage(page, content, { position });
+        logWrite("prepend", result.path, result.bytesAdded, {
+          inserted_after_frontmatter: result.insertedAfterFrontmatter,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err) {
+        return mapToolError(err, { tool: "prepend_to_page", page });
+      }
     },
   );
 
@@ -284,12 +447,16 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
       },
     },
     async ({ page }) => {
-      const result = await sb.softDeletePage(page);
-      logWrite("delete", page, 0, { trash_path: result.trashPath });
-      const payload = { deleted: true, trashPath: result.trashPath };
-      return {
-        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-      };
+      try {
+        const result = await sb.softDeletePage(page);
+        logWrite("delete", page, 0, { trash_path: result.trashPath });
+        const payload = { deleted: true, trashPath: result.trashPath };
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (err) {
+        return mapToolError(err, { tool: "delete_page", page });
+      }
     },
   );
 
