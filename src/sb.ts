@@ -101,10 +101,20 @@ export interface SearchHit {
 export class ConflictError extends Error {
   readonly path: string;
   readonly expectedLastModified: number;
+  /**
+   * The current server-side lastModified at the moment of conflict.
+   *
+   * Carried for server-side audit logging only — DO NOT include this value
+   * in any payload that crosses the MCP wire. The exact ms-precision
+   * lastModified is the optimistic-concurrency token for write_page, and
+   * leaking it through a conflict response would let a caller retry the
+   * write without re-reading the page (defeating the safety property that
+   * the caller must have seen the current body before overwriting).
+   */
   readonly actualLastModified: number;
   constructor(path: string, expected: number, actual: number) {
     super(
-      `Conflict on ${path}: expected lastModified=${expected}, server has ${actual}. ` +
+      `Conflict on ${path}: the page has been modified since you last read it. ` +
         `Re-read the page to reconcile before writing again.`
     );
     this.name = "ConflictError";

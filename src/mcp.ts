@@ -49,6 +49,34 @@ function logWrite(action: WriteAction, page: string, bytes: number, extra?: Reco
   console.error(parts.join(" "));
 }
 
+/**
+ * Round a ms-precision lastModified down to second precision.
+ *
+ * Apply this ONLY to timestamps that are conveying recency (list_pages,
+ * search_pages results, conflict-error remediation hints), never to
+ * timestamps that ARE the version marker for write_page.
+ *
+ * Rationale: the exact ms `lastModified` doubles as the optimistic-
+ * concurrency token for write_page. By contract, a caller may only
+ * obtain it through a tool that has handed back the full page body
+ * (read_page, create_page, write_page) — that's the safety property
+ * guaranteeing "you have seen what you're about to overwrite." Any
+ * other surface that exposes ms-precision `lastModified` becomes an
+ * accidental side-channel for that token. Rounding to seconds makes
+ * the value useful for recency display but useless as a write key,
+ * because the rounded value almost never matches the server's true
+ * ms value.
+ *
+ * DO NOT apply this to:
+ *   - the lastModified field returned by read_page (envelope)
+ *   - the lastModified field returned by create_page
+ *   - the lastModified field returned by write_page (post-write)
+ * These are the only legitimate ways to obtain the marker.
+ */
+function blurLastModified(ms: number): number {
+  return Math.floor(ms / 1000) * 1000;
+}
+
 /** Emit a structured error-audit line to stderr (mirrors logWrite shape). */
 function logError(tool: string, code: string, page: string | undefined, extra?: Record<string, unknown>): void {
   const parts = [
@@ -92,17 +120,21 @@ function toolError(payload: Record<string, unknown>) {
  */
 function mapToolError(err: unknown, ctx: { tool: string; page?: string }) {
   if (err instanceof ConflictError) {
+    // Audit line keeps both values for server-side observability — they
+    // do not cross the wire.
     logError(ctx.tool, "conflict", ctx.page, {
       expected: err.expectedLastModified,
       actual: err.actualLastModified,
     });
+    // Payload deliberately omits actualLastModified. See the comment on
+    // ConflictError.actualLastModified for why leaking it would defeat
+    // the write_page safety property.
     return toolError({
       error: "conflict",
       status: 409,
       message: err.message,
       path: err.path,
       expectedLastModified: err.expectedLastModified,
-      actualLastModified: err.actualLastModified,
       remediation:
         "Re-read the page to fetch its current body and lastModified, then retry write_page with that value.",
     });
@@ -205,7 +237,7 @@ function mapToolError(err: unknown, ctx: { tool: string; page?: string }) {
 export function buildMcpServer(sb: SilverBulletClient): McpServer {
   const server = new McpServer({
     name: "silverbullet",
-    version: "0.4.1",
+    version: "0.5.0",
   });
 
   server.registerTool(
@@ -213,7 +245,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "List pages",
       description:
-        "Return every markdown page in the SilverBullet space, sorted by last modified. Each entry carries {page, path, lastModified}. Use this to discover what notes exist before reading or searching. The lastModified value is suitable as expected_last_modified on write_page, though usually you'll want to read_page first to also see the body.",
+        "Return every markdown page in the SilverBullet space, sorted by last modified. Each entry carries {page, path, lastModified}. The lastModified here is rounded to the nearest second and is intended only for showing recency — it is NOT a valid expected_last_modified for write_page. To obtain a usable version marker, call read_page (or create_page / write_page).",
       inputSchema: {
         include_trash: z
           .boolean()
@@ -223,7 +255,8 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     },
     async ({ include_trash }) => {
       try {
-        const pages = await sb.listPages({ includeTrash: include_trash });
+        const raw = await sb.listPages({ includeTrash: include_trash });
+        const pages = raw.map((p) => ({ ...p, lastModified: blurLastModified(p.lastModified) }));
         return {
           content: [
             {
@@ -278,7 +311,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "Search pages",
       description:
-        "Case-insensitive substring search across page titles and page bodies. Returns the top matches with a short snippet around each hit. Slow on first call for large spaces (no index yet).",
+        "Case-insensitive substring search across page titles and page bodies. Returns the top matches with a short snippet around each hit. Slow on first call for large spaces (no index yet). Each hit's lastModified is rounded to the nearest second for recency display only — it is NOT a valid expected_last_modified for write_page. Call read_page to obtain a usable version marker.",
       inputSchema: {
         query: z.string().min(1).describe("Substring to search for"),
         limit: z
@@ -297,7 +330,8 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     },
     async ({ query, limit, include_trash }) => {
       try {
-        const hits = await sb.searchPages(query, limit ?? 20, { includeTrash: include_trash });
+        const raw = await sb.searchPages(query, limit ?? 20, { includeTrash: include_trash });
+        const hits = raw.map((h) => ({ ...h, lastModified: blurLastModified(h.lastModified) }));
         return {
           content: [
             {

@@ -114,7 +114,7 @@ echo "$WROTE"
 LM3=$(echo "$WROTE" | get_lm_from_single_block)
 echo "lastModified after write: $LM3"
 
-hr "5. write_page with stale expected_last_modified (conflict expected)"
+hr "5. write_page with stale expected_last_modified (conflict expected — payload must NOT include actualLastModified)"
 tool write_page "{\"page\":\"${PAGE}\",\"body\":\"won't land\",\"expected_last_modified\":${LM2}}"
 
 hr "6. write_page against a non-existent page (not_found expected)"
