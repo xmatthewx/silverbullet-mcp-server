@@ -1,6 +1,6 @@
-# fly.toml — silverbullet-mcp
+# fly.toml — silverbullet-mcp-server
 #
-# Set secrets before first deploy:
+# Rename `app` to your own Fly app, then set secrets before first deploy:
 #   fly secrets set SB_URL=https://notes.example.com
 #   fly secrets set SB_TOKEN=...           # the SB_AUTH_TOKEN on the SB side
 #   fly secrets set MCP_TOKEN=$(openssl rand -hex 32)
@@ -8,8 +8,8 @@
 # Then:
 #   fly deploy
 
-app  = "your-app"
-primary_region = "ewr"   # Newark — close to NYC
+app  = "your-app-name"
+primary_region = "ewr"   # pick a region near you (https://fly.io/docs/reference/regions/)
 
 [build]
 

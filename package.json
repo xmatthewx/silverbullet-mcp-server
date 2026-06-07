@@ -1,10 +1,27 @@
 {
-  "name": "silverbullet-mcp",
+  "name": "silverbullet-mcp-server",
   "version": "0.5.0",
-  "private": true,
-  "description": "MCP server that exposes a SilverBullet space over HTTP",
+  "description": "A standalone remote MCP server that exposes any hosted SilverBullet space to Claude over HTTP, with built-in OAuth 2.1 and collision-safe writes.",
   "type": "module",
   "main": "dist/index.js",
+  "license": "MIT",
+  "author": "Beta Brooklyn",
+  "homepage": "https://github.com/xmatthewx/silverbullet-mcp-server#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xmatthewx/silverbullet-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xmatthewx/silverbullet-mcp-server/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "silverbullet",
+    "claude",
+    "notes",
+    "oauth"
+  ],
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",

@@ -1,11 +1,36 @@
-# silverbullet-mcp
+# silverbullet-mcp-server
 
-A tiny MCP server that exposes a [SilverBullet](https://silverbullet.md) space
-to Claude over HTTP. v0.1 shipped read tools; v0.2 added a full write surface;
-v0.3 made overwrites collision-safe via `lastModified` envelopes; v0.4 surfaces
-every failure mode as a structured, visible error payload.
+A standalone MCP server that exposes a [SilverBullet](https://silverbullet.md)
+space to Claude over HTTP — with built-in OAuth 2.1, collision-safe writes, and
+structured, model-visible errors.
+
+It runs as its own service and talks to SilverBullet over the HTTP API, so it
+works against **any** hosted SilverBullet — including managed hosts like Pikapod
+where you can't drop in a sidecar container. (It can equally run as a sidecar next to a
+self-hosted instance; nothing ties it to one deployment model.) The examples
+below deploy to Fly.io, but the server is host-agnostic on both ends.
+
+It's built for a single user at personal note volume. A few scope choices
+(stateless JWTs, no refresh token, naive client-side search) are deliberate and
+flagged below — they double as the contribution roadmap.
+
+### Highlights
+
+- Standalone remote server — works with managed hosts, not just sidecar setups.
+- OAuth 2.1 built in (spec-compliant for the Claude.ai connector), plus a
+  static-token bypass for dev/curl.
+- Collision-safe overwrites via a `lastModified` version handshake.
+- Structured, model-visible errors carrying remediation hints.
+- Soft-delete, body-size cap, path validation, audit logging.
+
+Status: **v0.5**. See the [CHANGELOG](./CHANGELOG.md) for the full version
+history and the design reasoning behind each release.
 
 ## Architecture
+
+![Example deployment — Claude connects over OAuth to the MCP server (shown on Fly.io), which reads and writes your SilverBullet space (shown on Pikapod) over its HTTP API with a bearer token.](docs/sb-mcp-system-diagram.svg)
+
+The hosts shown (Fly.io, Pikapod) are just one example — both ends are swappable. The same flow in detail:
 
 ```
 Claude (web / mobile)
@@ -13,13 +38,13 @@ Claude (web / mobile)
         │  Streamable HTTP, Bearer <JWT>  (OAuth)
         │  -or- Bearer MCP_TOKEN          (dev / curl)
         ▼
-[ silverbullet-mcp on Fly.io ]   <-- this repo
+[ silverbullet-mcp-server — your host (e.g. Fly.io) ]   <-- this repo
         │   ↑  /authorize, /token, /.well-known/...
         │   │  Owner approves via OWNER_TOKEN in browser
         │
         │  GET /.fs, GET /.fs/<path>, Bearer SB_TOKEN
         ▼
-[ SilverBullet on Pikapod ]
+[ Your SilverBullet instance (e.g. Pikapod) ]
    notes.example.com
 ```
 
@@ -60,9 +85,9 @@ revisit if latency bites.
 
 **Version marker hygiene.** The ms-precision `lastModified` is the optimistic-concurrency token for `write_page`. By contract it is only obtainable from `read_page`, `create_page`, or `write_page` — the three tools that have surfaced the full page body. To stop the same value from leaking through other surfaces, `list_pages` and `search_pages` round each entry's `lastModified` to second precision (still useful for recency display, useless as a write key — the rounded value almost never matches the server's true ms value). The `conflict` error response includes `expectedLastModified` (echoing what the caller sent) and a generic "page has been modified" message, but does **not** include the server's current `lastModified` — otherwise a caller could retry the write using the leaked value without re-reading the body.
 
-**Error shape.** Every tool failure comes back as a regular content block carrying a JSON payload with `{error, status, message, ..., remediation}`. The `error` field is a short machine-readable code (`conflict`, `not_found`, `already_exists`, `too_large`, `forbidden_path`, `invalid_path`, `upstream`, `internal`); `status` mirrors the closest HTTP analog (e.g. 409 for `conflict`, 413 for `too_large`); `remediation` gives the agent a concrete next step. The handler stack does **not** set `isError: true` on the MCP response — the Claude.ai connector has been observed to swallow the content payload when that flag is set, leaving the model with only "Error occurred during tool execution." Returning the structured payload as ordinary content keeps the remediation visible. Every error also emits an `[ERROR] tool=... code=... page=...` audit line to stderr (Fly logs).
+**Error shape.** Every tool failure comes back as a regular content block carrying a JSON payload with `{error, status, message, ..., remediation}`. The `error` field is a short machine-readable code (`conflict`, `not_found`, `already_exists`, `too_large`, `forbidden_path`, `invalid_path`, `upstream`, `internal`); `status` mirrors the closest HTTP analog (e.g. 409 for `conflict`, 413 for `too_large`); `remediation` gives the agent a concrete next step. The handler stack does **not** set `isError: true` on the MCP response — the Claude.ai connector has been observed to swallow the content payload when that flag is set, leaving the model with only "Error occurred during tool execution." Returning the structured payload as ordinary content keeps the remediation visible. Every error also emits an `[ERROR] tool=... code=... page=...` audit line to stderr (your host's logs).
 
-**Write permission model.** Writes are gated by Claude.ai's per-tool permission UI — set each write tool to Ask for confirmation before every call. No server-side flag or separate OAuth scope; the same connector and credentials serve both read and write tools. On every write the server enforces: a 256 KB body cap, path validation (no `..`, empty segments, double `.md`), and `X-Permission: rw` on every PUT (omitting it would make SilverBullet silently mark the page read-only in its UI). Soft-delete moves pages to `_trash/YYYY-MM/`; collisions in the same month get a `-<unix-ms>` filename suffix. Trash is hidden from list and search by default; `include_trash: true` reveals it. All write operations emit `[WRITE]` audit lines to stderr (visible in Fly logs); `write_page` audit lines include both `expected_last_modified` and the resulting `last_modified`.
+**Write permission model.** Writes are gated by Claude.ai's per-tool permission UI — set each write tool to Ask for confirmation before every call. No server-side flag or separate OAuth scope; the same connector and credentials serve both read and write tools. On every write the server enforces: a 256 KB body cap, path validation (no `..`, empty segments, double `.md`), and `X-Permission: rw` on every PUT (omitting it would make SilverBullet silently mark the page read-only in its UI). Soft-delete moves pages to `_trash/YYYY-MM/`; collisions in the same month get a `-<unix-ms>` filename suffix. Trash is hidden from list and search by default; `include_trash: true` reveals it. All write operations emit `[WRITE]` audit lines to stderr (visible in your host's logs); `write_page` audit lines include both `expected_last_modified` and the resulting `last_modified`.
 
 ## Environment
 
@@ -78,7 +103,7 @@ See `.env.example`. All of the below are required at boot.
 | `OAUTH_CLIENT_SECRET`  | Opaque string. Paste into Claude.ai connector "Advanced settings."         |
 | `OWNER_TOKEN`          | The password you type into the browser login page to approve a client.    |
 | `JWT_SIGNING_KEY`      | Key used to sign 90-day access-token JWTs. Rotating it revokes all tokens.|
-| `PORT`                 | HTTP listen port (Fly maps internally). Default `8080`.                    |
+| `PORT`                 | HTTP listen port the server binds. Default `8080`; expose it however your host does. |
 
 ## Local development
 
@@ -117,7 +142,21 @@ curl -X POST http://localhost:8080/mcp \
   }'
 ```
 
-## Deploy to Fly.io
+## Deploy
+
+The server is a standard Node 20+ HTTP service — run it anywhere that runs Node
+(or use the included `Dockerfile`). Wherever it lives, you need to:
+
+- supply the environment variables from the table above as real secrets (never a
+  committed `.env`);
+- expose the listening `PORT` publicly over HTTPS;
+- set `PUBLIC_URL` to the exact public URL clients reach — it's baked into the
+  OAuth metadata, so it must match;
+- build and start: `npm run build && npm start` (or build the Docker image).
+
+### Example: Fly.io
+
+The repo ships a `fly.toml`, so Fly is the worked example.
 
 First time only:
 
@@ -145,9 +184,9 @@ fly deploy
 The server scales to zero when idle (see `auto_stop_machines = "suspend"` in
 `fly.toml`).
 
-Once you add a custom domain (`fly certs add mcp.example.com`),
-update `PUBLIC_URL` to match — OAuth metadata must point at the URL clients
-actually reach you on:
+Once you add a custom domain (`fly certs add mcp.example.com`), update
+`PUBLIC_URL` to match — OAuth metadata must point at the URL clients actually
+reach you on:
 
 ```bash
 fly secrets set PUBLIC_URL=https://mcp.example.com --app your-app
@@ -159,7 +198,7 @@ In Claude.ai → **Settings → Connectors → Add custom connector**:
 
 | Field                      | Value                                          |
 | -------------------------- | ---------------------------------------------- |
-| URL                        | `https://your-app.fly.dev/mcp`              |
+| URL                        | `https://your-app.fly.dev/mcp`                 |
 | (Advanced) Client ID       | The `OAUTH_CLIENT_ID` from your secrets        |
 | (Advanced) Client Secret   | The `OAUTH_CLIENT_SECRET` from your secrets    |
 
@@ -185,5 +224,16 @@ immediately, rotate `JWT_SIGNING_KEY` and redeploy.
 - v0.7 — refresh tokens, so JWT renewal is silent.
 - future — path-prefix allowlist (restrict writes to specific directories if the broad write surface ever feels too open); atomic writes (current SB backend uses non-atomic `os.WriteFile`); switch `statFile` to a header-based metadata GET once SB's `Last-Modified` header behavior is verified, to avoid the per-write directory listing.
 
-See `Home/docs/silverbullet/silverbullet-mcp-setup.md` for active task list,
-testing plan, and decision log.
+The [CHANGELOG](./CHANGELOG.md) doubles as a design log — the reasoning behind
+each release, not just the diff.
+
+## Maintenance
+
+Provided as-is. This is a personal-scale project, shared in case it's useful to
+others; expect light, best-effort maintenance. Issues and pull requests are
+welcome — especially against the roadmap items above — but response times will
+vary.
+
+## License
+
+[MIT](./LICENSE) © Beta Brooklyn.
