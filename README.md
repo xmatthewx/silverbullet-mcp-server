@@ -1,18 +1,29 @@
 # silverbullet-mcp-server
 
-A standalone MCP server that exposes a [SilverBullet](https://silverbullet.md)
+Run your own private notes platform that you and Claude can reach, both online and locally on your computer.
+
+[SilverBullet](https://silverbullet.md) is an open-source, self-hosted notes app where every note is a markdown file you control, an open alternative to Notion or Obsidian. Pair it with the
+[SilverBullet.plus](https://silverbullet.plus) desktop app and your space syncs to local files, so Claude Code and Cowork can edit them directly. What's still missing is letting Claude on web and mobile reach the same space. **That's the link this server provides:** a remote MCP endpoint with OAuth, so Claude.ai works with your notes from anywhere — collision-safe, so nothing clobbers your edits.
+
+New to all this? You can go from nothing to a private, Claude-connected notes
+platform in about 20 minutes. 
+
+→ [QUICKSTART: zero to platform](docs/QUICKSTART.md)
+
+## Intro
+
+`silverbullet-mcp-server` is standalone MCP that exposes a [SilverBullet](https://silverbullet.md)
 space to Claude over HTTP — with built-in OAuth 2.1, collision-safe writes, and
 structured, model-visible errors.
 
 It runs as its own service and talks to SilverBullet over the HTTP API, so it
 works against **any** hosted SilverBullet — including managed hosts like Pikapod
-where you can't drop in a sidecar container. (It can equally run as a sidecar next to a
-self-hosted instance; nothing ties it to one deployment model.) The examples
+where you can't drop in a sidecar container. (It can equally run as a sidecar next to a self-hosted instance; nothing ties it to one deployment model.) The examples
 below deploy to Fly.io, but the server is host-agnostic on both ends.
 
-It's built for a single user at personal note volume. A few scope choices
+For now, it's built for a single user at personal note volume. A few scope choices
 (stateless JWTs, no refresh token, naive client-side search) are deliberate and
-flagged below — they double as the contribution roadmap.
+flagged below.
 
 ### Highlights
 
@@ -163,13 +174,20 @@ First time only:
 ```bash
 fly apps create your-app
 
+# Generate and save your OAuth pair first — you'll paste these into Claude.ai's
+# connector settings, and Fly can't show them to you again later.
+export OAUTH_CLIENT_ID=$(uuidgen | tr 'A-Z' 'a-z')
+export OAUTH_CLIENT_SECRET=$(openssl rand -hex 32)
+echo "CLIENT_ID:     $OAUTH_CLIENT_ID"
+echo "CLIENT_SECRET: $OAUTH_CLIENT_SECRET"
+
 fly secrets set \
   SB_URL=https://notes.example.com \
   SB_TOKEN=<your SB_AUTH_TOKEN> \
   MCP_TOKEN=$(openssl rand -hex 32) \
   PUBLIC_URL=https://your-app.fly.dev \
-  OAUTH_CLIENT_ID=$(uuidgen | tr 'A-Z' 'a-z') \
-  OAUTH_CLIENT_SECRET=$(openssl rand -hex 32) \
+  OAUTH_CLIENT_ID=$OAUTH_CLIENT_ID \
+  OAUTH_CLIENT_SECRET=$OAUTH_CLIENT_SECRET \
   OWNER_TOKEN=<something memorable but not guessable> \
   JWT_SIGNING_KEY=$(openssl rand -hex 64) \
   --app your-app
