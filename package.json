@@ -1,6 +1,6 @@
 {
   "name": "silverbullet-mcp-server",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A standalone remote MCP server that exposes any hosted SilverBullet space to Claude over HTTP, with built-in OAuth 2.1 and collision-safe writes.",
   "type": "module",
   "main": "dist/index.js",

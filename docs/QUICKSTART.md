@@ -11,6 +11,8 @@
 > Cowork — and it can walk you through any step, explain a command, or help you
 > debug when something doesn't come up green.
 
+![Example deployment — Claude connects over OAuth to the MCP server (shown on Fly.io), which reads and writes your SilverBullet space (shown on Pikapod) over its HTTP API with a bearer token.](sb-mcp-system-diagram.svg)
+
 This is the full chain — nothing assumed. If you already run SilverBullet, skip to
 [Step 2](#step-2-deploy-the-mcp-server-on-flyio).
 

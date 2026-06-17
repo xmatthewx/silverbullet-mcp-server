@@ -32,9 +32,10 @@ flagged below.
   static-token bypass for dev/curl.
 - Collision-safe overwrites via a `lastModified` version handshake.
 - Structured, model-visible errors carrying remediation hints.
+- Safe page moves (`move_page`): read→create→delete with a source-unchanged guard; never leaves a caller able to clobber an interim edit.
 - Soft-delete, body-size cap, path validation, audit logging.
 
-Status: **v0.5**. See the [CHANGELOG](./CHANGELOG.md) for the full version
+Status: **v0.6**. See the [CHANGELOG](./CHANGELOG.md) for the full version
 history and the design reasoning behind each release.
 
 ## Architecture
@@ -88,13 +89,16 @@ revisit if latency bites.
 | ----------------- | --------------------------------------------- | ---------------------------------------------------------------- |
 | `create_page`     | `page`, `body`                                | Creates a new page; errors if it already exists. Returns `{path, lastModified}`. |
 | `write_page`      | `page`, `body`, `expected_last_modified`      | Overwrites an existing page. **Collision-safe**: rejected with a conflict error if the server's current `lastModified` differs from `expected_last_modified`. Refuses to create new pages (use `create_page`). Returns `{path, lastModified}`. |
-| `append_to_page`  | `page`, `content`                             | Appends content at the end, separated by a blank line. No `lastModified` returned (caller has not seen the body and isn't write-ready). |
-| `prepend_to_page` | `page`, `content`, `position?`                | Inserts at top or after YAML frontmatter (default). Server-side concat — the existing body never passes through the model. No `lastModified` returned. |
+| `append_to_page`  | `page`, `content`                             | Appends content at the end, separated by a blank line. Errors if the page does not exist. No `lastModified` returned (caller has not seen the body and isn't write-ready). |
+| `prepend_to_page` | `page`, `content`, `position?`                | Inserts at top or after YAML frontmatter (default). Errors if the page does not exist. Server-side concat — the existing body never passes through the model. No `lastModified` returned. |
+| `move_page`       | `from`, `to`                                  | Creates destination (refuses if it exists), re-checks source unchanged, then soft-deletes source. Does **not** rewrite `[[backlinks]]`. Returns `{from, to, moved}` — no `lastModified`. |
 | `delete_page`     | `page`                                        | Soft-deletes to `_trash/YYYY-MM/<original-path>`.                |
 
 **Collision-safe overwrites.** `write_page` enforces a version handshake. Workflow: `read_page` returns the current `lastModified` alongside the body; pass that value back as `expected_last_modified` on the subsequent `write_page`. If the page changed in between, the write is rejected with a conflict error and the caller should re-read to reconcile. `create_page` returns a fresh `lastModified` so a caller is left write-ready immediately after creation. `append_to_page` and `prepend_to_page` deliberately omit `lastModified` from their responses — they merge server-side without the caller seeing the full body, so the caller is not in a position to follow up with a guarded `write_page`. There is a narrow TOCTOU window inside `write_page` between the conflict check and the PUT — acceptable for a single-user space; closing it would require an `If-Unmodified-Since` (or equivalent) on the SilverBullet side.
 
-**Version marker hygiene.** The ms-precision `lastModified` is the optimistic-concurrency token for `write_page`. By contract it is only obtainable from `read_page`, `create_page`, or `write_page` — the three tools that have surfaced the full page body. To stop the same value from leaking through other surfaces, `list_pages` and `search_pages` round each entry's `lastModified` to second precision (still useful for recency display, useless as a write key — the rounded value almost never matches the server's true ms value). The `conflict` error response includes `expectedLastModified` (echoing what the caller sent) and a generic "page has been modified" message, but does **not** include the server's current `lastModified` — otherwise a caller could retry the write using the leaked value without re-reading the body.
+**Version marker hygiene.** The ms-precision `lastModified` is the optimistic-concurrency token for `write_page`. By contract it is only obtainable from `read_page`, `create_page`, or `write_page` — the three tools that have surfaced the full page body. To stop the same value from leaking through other surfaces, `list_pages` and `search_pages` round each entry's `lastModified` to second precision (still useful for recency display, useless as a write key — the rounded value almost never matches the server's true ms value). The `conflict` error response includes `expectedLastModified` (echoing what the caller sent) and a generic "page has been modified" message, but does **not** include the server's current `lastModified` — otherwise a caller could retry the write using the leaked value without re-reading the body. `move_page` suppresses `lastModified` on every path — success and all errors — for the same reason: a leaked source marker would let a caller issue a `write_page` that overwrites edits made to the still-existing source after the move's read step.
+
+**What `move_page` does not do.** It does not rewrite `[[backlinks]]` to the old page name. SilverBullet's `Page: Rename` command handles backlink rewriting, but it's a client-side editor command that requires editor context — not reachable headless over HTTP. If SilverBullet ever exposes Rename as an API call, we'd switch to it.
 
 **Error shape.** Every tool failure comes back as a regular content block carrying a JSON payload with `{error, status, message, ..., remediation}`. The `error` field is a short machine-readable code (`conflict`, `not_found`, `already_exists`, `too_large`, `forbidden_path`, `invalid_path`, `upstream`, `internal`); `status` mirrors the closest HTTP analog (e.g. 409 for `conflict`, 413 for `too_large`); `remediation` gives the agent a concrete next step. The handler stack does **not** set `isError: true` on the MCP response — the Claude.ai connector has been observed to swallow the content payload when that flag is set, leaving the model with only "Error occurred during tool execution." Returning the structured payload as ordinary content keeps the remediation visible. Every error also emits an `[ERROR] tool=... code=... page=...` audit line to stderr (your host's logs).
 
@@ -238,9 +242,15 @@ immediately, rotate `JWT_SIGNING_KEY` and redeploy.
 - v0.3 — collision-safe overwrites via `lastModified` envelopes; `read_page` returns `{path, lastModified}` + body; `write_page` requires `expected_last_modified` and is overwrite-only. **Shipped.**
 - v0.4 — typed errors (`ConflictError`, `PageNotFoundError`, `FileNotFoundError`, `PageAlreadyExistsError`, `BodyTooLargeError`, `ForbiddenPathError`, `InvalidPathError`, `UpstreamError`) routed through a central `mapToolError` that returns structured `{error, status, message, remediation}` payloads as regular content (no `isError`), plus `[ERROR]` audit lines. **Shipped.**
 - v0.5 — version-marker hygiene: `lastModified` no longer leaks through `list_pages`, `search_pages`, or conflict-error payloads; rounded to second precision in recency contexts. **Shipped.**
-- v0.6 — cached file index, real search ranking, frontmatter awareness.
-- v0.7 — refresh tokens, so JWT renewal is silent.
-- future — path-prefix allowlist (restrict writes to specific directories if the broad write surface ever feels too open); atomic writes (current SB backend uses non-atomic `os.WriteFile`); switch `statFile` to a header-based metadata GET once SB's `Last-Modified` header behavior is verified, to avoid the per-write directory listing.
+- v0.6 — `move_page` (safe page move); `append_to_page` / `prepend_to_page` no longer silently create pages. **Shipped.**
+
+Planned, not yet scheduled:
+
+- Cached file index, real search ranking, frontmatter awareness.
+- Refresh tokens, so JWT renewal is silent.
+- Path-prefix allowlist (restrict writes to specific directories if the broad write surface ever feels too open).
+- Atomic writes (current SB backend uses non-atomic `os.WriteFile`).
+- Switch `statFile` to a header-based metadata GET once SB's `Last-Modified` header behavior is verified, to avoid the per-write directory listing.
 
 The [CHANGELOG](./CHANGELOG.md) doubles as a design log — the reasoning behind
 each release, not just the diff.

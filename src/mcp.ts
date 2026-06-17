@@ -28,7 +28,7 @@ import {
   UpstreamError,
 } from "./sb.js";
 
-type WriteAction = "create" | "write" | "append" | "prepend" | "delete";
+type WriteAction = "create" | "write" | "append" | "prepend" | "delete" | "move";
 
 /**
  * Emit a structured write-audit line to stderr.
@@ -237,7 +237,7 @@ function mapToolError(err: unknown, ctx: { tool: string; page?: string }) {
 export function buildMcpServer(sb: SilverBulletClient): McpServer {
   const server = new McpServer({
     name: "silverbullet",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   server.registerTool(
@@ -421,7 +421,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "Append to page",
       description:
-        "Append a block of text to the end of a page, separated by a blank line. Creates the page if it does not exist. The existing page body is read server-side and never round-trips through this conversation, which avoids accidental modification of existing content. Final page size is capped at 256 KB. Does not return lastModified — append intentionally leaves the caller without a version marker, since you have not seen the full body and so are not in a position to follow up with write_page. Call read_page if you need to.",
+        "Append a block of text to the end of an existing page, separated by a blank line. Errors if the page does not exist — use create_page for new pages. The existing page body is read server-side and never round-trips through this conversation, which avoids accidental modification of existing content. Final page size is capped at 256 KB. Does not return lastModified — append intentionally leaves the caller without a version marker, since you have not seen the full body and so are not in a position to follow up with write_page. Call read_page if you need to.",
       inputSchema: {
         page: z.string().min(1).describe("Page name relative to the space root, without the .md suffix"),
         content: z.string().min(1).describe("Text to append"),
@@ -445,7 +445,7 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
     {
       title: "Prepend to page",
       description:
-        "Insert content at the top of a page. By default, inserts after YAML frontmatter if present (so frontmatter stays at byte 0); set position to \"top\" to force insertion at byte 0 even when frontmatter exists. Creates the page if it does not exist. The existing page body is read server-side and never round-trips through this conversation. Final page size is capped at 256 KB. Does not return lastModified — prepend intentionally leaves the caller without a version marker, since you have not seen the full body and so are not in a position to follow up with write_page. Call read_page if you need to.",
+        "Insert content at the top of an existing page. By default, inserts after YAML frontmatter if present (so frontmatter stays at byte 0); set position to \"top\" to force insertion at byte 0 even when frontmatter exists. Errors if the page does not exist — use create_page for new pages. The existing page body is read server-side and never round-trips through this conversation. Final page size is capped at 256 KB. Does not return lastModified — prepend intentionally leaves the caller without a version marker, since you have not seen the full body and so are not in a position to follow up with write_page. Call read_page if you need to.",
       inputSchema: {
         page: z.string().min(1).describe("Page name relative to the space root, without the .md suffix"),
         content: z.string().min(1).describe("Text to insert"),
@@ -490,6 +490,41 @@ export function buildMcpServer(sb: SilverBulletClient): McpServer {
         };
       } catch (err) {
         return mapToolError(err, { tool: "delete_page", page });
+      }
+    },
+  );
+
+  server.registerTool(
+    "move_page",
+    {
+      title: "Move page",
+      description:
+        "Move a page to a new location (read → create destination → delete source). Refuses if the destination already exists. If the source was edited between the read and the delete, the delete is skipped — leaving a recoverable duplicate at the destination rather than losing interim edits. Does NOT rewrite [[backlinks]] — SilverBullet's backlink-rewriting Rename is an editor-only command, not reachable over HTTP. Returns {from, to, moved} with no version marker. One approval covers both the create and the soft-delete.",
+      inputSchema: {
+        from: z.string().min(1).describe("Source page name to move"),
+        to: z.string().min(1).describe("Destination page name"),
+      },
+    },
+    async ({ from, to }) => {
+      try {
+        const result = await sb.movePage(from, to);
+        logWrite("move", from, 0, { from: result.from, to: result.to });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          const conflictResult = mapToolError(err, { tool: "move_page", page: from });
+          const payload = JSON.parse(conflictResult.content[0].text);
+          payload.remediation =
+            "The source page was modified after move_page read it. The destination may contain a duplicate. " +
+            "Re-read the source page to check its current state, and remove the duplicate at the destination if needed.";
+          delete payload.expectedLastModified;
+          return {
+            content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          };
+        }
+        return mapToolError(err, { tool: "move_page", page: from });
       }
     },
   );

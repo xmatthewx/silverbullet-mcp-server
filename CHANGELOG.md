@@ -6,6 +6,43 @@ trade-off behind it, since the reasoning is often more useful than the diff.
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] — Safe page moves; append/prepend tightening
+
+### Added
+
+- `move_page` tool: moves a page to a new location via
+  read → create(destination) → re-stat(source) → soft-delete(source).
+  `create_page` serves as the clobber guard — it refuses an existing
+  destination, so the source is never deleted when the move can't land
+  cleanly. A source-unchanged guard (re-stat before delete) catches
+  edits made to the source between the read and the delete; if the source
+  changed, the delete is skipped, leaving a recoverable duplicate at the
+  destination rather than losing interim edits. The worst case anywhere
+  in the chain is a leftover duplicate, never data loss.
+- Why no backlink rewrite: SilverBullet's `Page: Rename` command — the
+  one that rewrites `[[backlinks]]` — is a client-side editor command
+  that needs editor context. It's not reachable headless over HTTP. If SB
+  ever exposes Rename as an API call, we'd switch to it.
+- Timestamp suppression: no `move_page` response — success or any
+  error — carries a server `lastModified`. The caller never saw the body,
+  so handing back a version marker would violate the same write-readiness
+  contract that `append_to_page` and `prepend_to_page` follow. The
+  internal `lastModified` values (used for the source-unchanged guard)
+  stay in `[MOVE]` audit lines only.
+- Moves into `_trash/` are blocked — use `delete_page` for that; it
+  handles date-bucketed paths and collision suffixes. Moving *out of*
+  `_trash/` (a restore) is allowed.
+
+### Changed
+
+- `append_to_page` and `prepend_to_page` no longer silently create a
+  page when the target doesn't exist. They now return a `not_found`
+  error, directing the caller to use `create_page` instead. This closes
+  a gap where a typo or wrong path would succeed silently — the kind of
+  failure that's confusing to debug later. Existing callers that relied
+  on the auto-create behavior should add an explicit `create_page` call
+  first.
+
 ## [0.5.0] — Version-marker hygiene
 
 - `list_pages` and `search_pages` now round each entry's `lastModified` to

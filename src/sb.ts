@@ -514,7 +514,8 @@ export class SilverBulletClient {
 
   /**
    * Append content to an existing page, separated by a blank line.
-   * Creates the page if it does not yet exist.
+   * Throws FileNotFoundError if the page does not exist — use create_page
+   * for new pages.
    *
    * A single blank line (existing newline + inserted newline) separates the
    * original body from the appended block — this mirrors typical Markdown
@@ -529,8 +530,7 @@ export class SilverBulletClient {
     const bytesAdded = Buffer.byteLength(content, "utf8");
 
     if (!(await this.existsFile(path))) {
-      await this.writeFile(path, content);
-      return { path, bytesAdded };
+      throw new FileNotFoundError(path);
     }
 
     let existing = await this.readFile(path);
@@ -548,6 +548,8 @@ export class SilverBulletClient {
 
   /**
    * Prepend content to a page, optionally inserting after YAML frontmatter.
+   * Throws FileNotFoundError if the page does not exist — use create_page
+   * for new pages.
    *
    * @param opts.position - `"after_frontmatter"` (default) inserts after the
    *   closing `---` of YAML frontmatter, if present; falls back to top of file.
@@ -571,8 +573,7 @@ export class SilverBulletClient {
     const position = opts?.position ?? "after_frontmatter";
 
     if (!(await this.existsFile(path))) {
-      await this.writeFile(path, content);
-      return { path, bytesAdded, insertedAfterFrontmatter: false };
+      throw new FileNotFoundError(path);
     }
 
     const existing = await this.readFile(path);
@@ -640,6 +641,67 @@ export class SilverBulletClient {
     await this.deleteFile(path);
 
     return { trashPath };
+  }
+
+  /**
+   * Move a page from one path to another.
+   *
+   * Implemented as read → create(dest) → re-stat(source) → delete(source).
+   * `create` is the clobber guard — it refuses an existing destination.
+   * The re-stat guard catches edits to the source between our read and
+   * the delete; if the source changed, the delete is skipped, leaving a
+   * recoverable duplicate at `to` rather than losing interim edits.
+   *
+   * Does NOT rewrite [[backlinks]] — SilverBullet's Rename command is
+   * editor-only and not reachable over HTTP.
+   *
+   * No response (success or error) carries a server lastModified — the
+   * caller never saw the body, so handing back a version marker would
+   * violate the write-readiness contract.
+   */
+  async movePage(
+    from: string,
+    to: string,
+  ): Promise<{ from: string; to: string; moved: true }> {
+    const fromPath = validatePagePath(from);
+    const toPath = validatePagePath(to);
+
+    if (fromPath === toPath) {
+      throw new InvalidPathError(to, "source and destination are identical");
+    }
+    if (toPath.startsWith("_trash/")) {
+      throw new ForbiddenPathError(toPath, "use delete_page to soft-delete; move into _trash/ is not allowed");
+    }
+
+    // 1. Read source body + snapshot its lastModified.
+    const content = await this.readFile(fromPath);
+    const statBefore = await this.statFile(fromPath);
+    if (!statBefore) throw new FileNotFoundError(fromPath);
+    const lastModifiedAtRead = statBefore.lastModified;
+
+    // 2. Create destination — refuses if it already exists.
+    await this.createPage(to, content);
+
+    // 3. Re-stat source — abort delete if it changed since our read.
+    const statAfter = await this.statFile(fromPath);
+    if (!statAfter || statAfter.lastModified !== lastModifiedAtRead) {
+      throw new ConflictError(fromPath, lastModifiedAtRead, statAfter?.lastModified ?? 0);
+    }
+
+    // 4. Soft-delete source.
+    try {
+      await this.softDeletePage(from);
+    } catch (err) {
+      throw new UpstreamError(
+        `Move created ${toPath} but failed to delete source ${fromPath}. ` +
+          `A duplicate now exists at ${toPath}. ` +
+          `Original error: ${err instanceof Error ? err.message : String(err)}`,
+        null,
+        fromPath,
+      );
+    }
+
+    return { from: fromPath, to: toPath, moved: true };
   }
 
   /**
